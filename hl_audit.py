@@ -62,11 +62,26 @@ GIL_RELEASING = {
 }
 
 # Calls that are unambiguously I/O.
+# NOTE: `get` is deliberately omitted -- it collides with dict.get / .get on
+# any mapping, which is the most common Python method name in existence.
+# We rely on _network_module check below for `requests.get` / `urllib.get`.
 IO_NAMES = {
-    "open", "read", "write", "readline", "readlines", "send", "recv",
-    "sendall", "get", "post", "put", "delete", "urlopen", "connect",
-    "accept", "fetch", "query", "execute", "executemany",
+    "open", "readline", "readlines", "send", "recv", "sendall",
+    "post", "put", "urlopen", "connect", "accept", "fetch",
+    "query", "execute", "executemany",
 }
+
+# I/O calls that count as "substantial" -- the kind that genuinely release
+# the GIL for non-trivial time. file open() does NOT count: it's microseconds
+# and the actual file I/O is in subsequent .read()/.write() calls. Used by
+# the threading_on_cpu second pass to decide whether a worker is "really"
+# I/O-bound or just incidentally touches a file.
+SUBSTANTIAL_IO_NAMES = {
+    "send", "recv", "sendall", "post", "put", "urlopen", "connect",
+    "accept", "fetch", "query", "execute", "executemany", "sleep",
+}
+
+NETWORK_MODULES = {"requests", "urllib", "httpx", "aiohttp", "socket"}
 
 # Modules whose use inside a loop kills cache locality when the data is
 # Python objects (vs. when the module call itself is vectorized).
@@ -96,7 +111,14 @@ class StaticProfile:
     large_comprehension: bool = False
     gil_releasing_calls: bool = False
     io_calls: bool = False
+    substantial_io_calls: bool = False  # network/socket/sleep -- counts as "really I/O bound"
     global_state_writes: bool = False
+    # Phase 2 signals
+    string_concat_in_loop: bool = False
+    pandas_grow_in_loop: bool = False
+    uses_thread_pool: bool = False        # this function dispatches to a thread pool / Thread()
+    thread_targets: List[str] = field(default_factory=list)  # names of functions handed to threads
+    threading_on_cpu: bool = False        # set in a second pass once all StaticProfiles are built
 
 
 @dataclass
@@ -134,6 +156,15 @@ class _FuncVisitor(ast.NodeVisitor):
     def __init__(self, profile: StaticProfile) -> None:
         self.profile = profile
         self._loop_stack: List[ast.AST] = []
+        # Names locally bound to a string in this function. Used to decide
+        # whether `s += x` inside a loop is the quadratic-string-concat
+        # footgun. Conservative: only counts bindings the visitor sees
+        # *before* the AugAssign in source order.
+        self._string_typed_names: set = set()
+        # Names locally bound to a pandas DataFrame (any pd.DataFrame(...)
+        # / pd.read_csv(...) / pd.concat(...) call). Used for the pandas
+        # grow-in-loop detector.
+        self._dataframe_typed_names: set = set()
 
     # -- loops --------------------------------------------------------------
     def visit_For(self, node: ast.For) -> None:
@@ -201,6 +232,13 @@ class _FuncVisitor(ast.NodeVisitor):
 
         if name in IO_NAMES:
             self.profile.io_calls = True
+        if name in SUBSTANTIAL_IO_NAMES:
+            self.profile.substantial_io_calls = True
+            self.profile.io_calls = True
+        # Network-library calls: requests.get / urllib.urlopen / httpx.get / etc.
+        if module in NETWORK_MODULES and name in {"get", "post", "put", "delete", "request", "urlopen", "head", "patch"}:
+            self.profile.io_calls = True
+            self.profile.substantial_io_calls = True
         if name in GIL_RELEASING and module in VECTOR_MODULES | {None, "os", "io", "socket", "time", "requests", "urllib"}:
             self.profile.gil_releasing_calls = True
         if name in PURE_MATH_CALLS and module not in VECTOR_MODULES:
@@ -217,6 +255,109 @@ class _FuncVisitor(ast.NodeVisitor):
                 if isinstance(arg, (ast.Tuple, ast.Dict, ast.List, ast.Set, ast.Call)):
                     self.profile.list_of_small_objects_build = True
 
+        # ---- Phase 2 detectors ------------------------------------------------
+        # (a) Pandas grow-in-loop: pd.concat([<known_df>, ...]) inside a loop,
+        #     or <known_df>.append(...) inside a loop. The "known_df" check
+        #     uses the local binding map populated by visit_Assign.
+        if in_loop and module in {"pd", "pandas"} and name == "concat":
+            for arg in node.args:
+                if isinstance(arg, (ast.List, ast.Tuple)):
+                    for elt in arg.elts:
+                        if isinstance(elt, ast.Name) and elt.id in self._dataframe_typed_names:
+                            self.profile.pandas_grow_in_loop = True
+                            break
+        if in_loop and name == "append" and isinstance(node.func, ast.Attribute):
+            recv = node.func.value
+            if isinstance(recv, ast.Name) and recv.id in self._dataframe_typed_names:
+                self.profile.pandas_grow_in_loop = True
+
+        # (b) Thread-pool dispatch: ThreadPoolExecutor().map/submit(<funcname>, ...)
+        #     or threading.Thread(target=<funcname>). Just record the target
+        #     names; the second pass decides whether the targets are CPU-bound.
+        if name in {"map", "submit"} and isinstance(node.func, ast.Attribute):
+            # heuristic: anything called .map(fn, ...) / .submit(fn, ...) where
+            # the receiver was bound from a ThreadPoolExecutor()
+            recv = node.func.value
+            if isinstance(recv, ast.Name) and recv.id in getattr(self, "_threadpool_names", set()):
+                self.profile.uses_thread_pool = True
+                if node.args and isinstance(node.args[0], ast.Name):
+                    self.profile.thread_targets.append(node.args[0].id)
+        if name == "Thread" and module in {"threading", None}:
+            # threading.Thread(target=<Name>)
+            for kw in node.keywords:
+                if kw.arg == "target" and isinstance(kw.value, ast.Name):
+                    self.profile.uses_thread_pool = True
+                    self.profile.thread_targets.append(kw.value.id)
+
+        self.generic_visit(node)
+
+    # -- assignments: track local types we care about ------------------------
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # If the RHS is a string literal / f-string / str(...) call, the
+        # target name(s) become "string-typed" for the purposes of the
+        # quadratic-concat detector.
+        rhs = node.value
+        rhs_is_string = False
+        if isinstance(rhs, ast.Constant) and isinstance(rhs.value, str):
+            rhs_is_string = True
+        elif isinstance(rhs, ast.JoinedStr):  # f-string
+            rhs_is_string = True
+        elif isinstance(rhs, ast.Call):
+            fname = _call_last_name(rhs)
+            if fname == "str":
+                rhs_is_string = True
+
+        # Pandas-typed binding: pd.DataFrame(...) / pd.read_csv(...) / pd.concat(...)
+        rhs_is_df = False
+        if isinstance(rhs, ast.Call):
+            if _call_module_hint(rhs) in {"pd", "pandas"}:
+                if _call_last_name(rhs) in {"DataFrame", "read_csv", "read_parquet", "read_json", "concat"}:
+                    rhs_is_df = True
+
+        # ThreadPoolExecutor binding: ThreadPoolExecutor(...) used as a context
+        # manager target. We capture the binding name for later .map/.submit.
+        rhs_is_threadpool = False
+        if isinstance(rhs, ast.Call):
+            if _call_last_name(rhs) == "ThreadPoolExecutor":
+                rhs_is_threadpool = True
+
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name):
+                if rhs_is_string:
+                    self._string_typed_names.add(tgt.id)
+                if rhs_is_df:
+                    self._dataframe_typed_names.add(tgt.id)
+                if rhs_is_threadpool:
+                    self._note_threadpool_name(tgt.id)
+        self.generic_visit(node)
+
+    def visit_With(self, node: ast.With) -> None:
+        # `with ThreadPoolExecutor(...) as ex:` -- bind `ex` as a thread pool.
+        for item in node.items:
+            if (
+                isinstance(item.context_expr, ast.Call)
+                and _call_last_name(item.context_expr) == "ThreadPoolExecutor"
+                and isinstance(item.optional_vars, ast.Name)
+            ):
+                self._note_threadpool_name(item.optional_vars.id)
+        self.generic_visit(node)
+
+    def _note_threadpool_name(self, name: str) -> None:
+        if not hasattr(self, "_threadpool_names"):
+            self._threadpool_names = set()
+        self._threadpool_names.add(name)
+
+    # -- AugAssign: catch quadratic string concat ----------------------------
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if (
+            self._loop_stack
+            and isinstance(node.op, ast.Add)
+            and isinstance(node.target, ast.Name)
+        ):
+            target_known_string = node.target.id in self._string_typed_names
+            value_looks_string = _expr_looks_stringy(node.value)
+            if target_known_string or value_looks_string:
+                self.profile.string_concat_in_loop = True
         self.generic_visit(node)
 
     # -- global writes -------------------------------------------------------
@@ -241,12 +382,45 @@ def _call_module_hint(node: ast.Call) -> Optional[str]:
     return None
 
 
+def _expr_looks_stringy(node: ast.AST) -> bool:
+    """True if `node` is syntactically a string-producing expression.
+
+    Used by the string-concat detector to recognize that the RHS of `+=` is
+    a string even when we don't have a binding-site type for the LHS. Catches
+    f-strings, str literals, str(...) calls, .format() calls, .join() calls,
+    and BinOp chains where one side is any of the above.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return True
+    if isinstance(node, ast.JoinedStr):  # f-string
+        return True
+    if isinstance(node, ast.Call):
+        last = _call_last_name(node)
+        if last in {"str", "format", "join", "repr"}:
+            return True
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _expr_looks_stringy(node.left) or _expr_looks_stringy(node.right)
+    return False
+
+
 def analyze_file_static(path: str) -> Dict[Tuple[str, int, str], StaticProfile]:
-    """Return a map (filename, lineno, funcname) -> StaticProfile."""
+    """Return a map (filename, lineno, funcname) -> StaticProfile.
+
+    Two passes:
+      1. Per-function AST visit fills in StaticProfile fields.
+      2. Resolve `threading_on_cpu`: for any function that dispatches to a
+         thread pool with a target named locally in this file, look up the
+         target's StaticProfile. If the target has no I/O calls and no
+         GIL-releasing calls but does have a loop or pure-Python math, the
+         dispatching function is using threading on CPU-bound code.
+    """
     with open(path, "r", encoding="utf-8") as fh:
         source = fh.read()
     tree = ast.parse(source, filename=path)
+
+    # Pass 1: per-function visit
     out: Dict[Tuple[str, int, str], StaticProfile] = {}
+    by_name: Dict[str, StaticProfile] = {}
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             prof = StaticProfile(
@@ -256,6 +430,28 @@ def analyze_file_static(path: str) -> Dict[Tuple[str, int, str], StaticProfile]:
             )
             _FuncVisitor(prof).visit(node)
             out[(prof.filename, prof.lineno, prof.qualname)] = prof
+            by_name[node.name] = prof
+
+    # Pass 2: resolve threading-on-cpu using the local call graph
+    for prof in out.values():
+        if not prof.uses_thread_pool:
+            continue
+        for target_name in prof.thread_targets:
+            target = by_name.get(target_name)
+            if target is None:
+                # Can't resolve -- not enough evidence to make a claim. Skip
+                # silently. (Per the no-fallbacks rule, this is "insufficient
+                # evidence", not a fallback to a degraded mode.)
+                continue
+            cpu_bound = (
+                not target.substantial_io_calls
+                and not target.gil_releasing_calls
+                and (target.has_any_loop or target.pure_python_math_anywhere)
+            )
+            if cpu_bound:
+                prof.threading_on_cpu = True
+                break
+
     return out
 
 
@@ -375,11 +571,88 @@ CATEGORY_CPU = "CPU_PARALLELIZE"
 CATEGORY_CPU_CAUTION = "CPU_PARALLELIZE_CAUTION"
 CATEGORY_IO = "ASYNC_OR_THREADS"
 CATEGORY_LEAVE = "LEAVE_ALONE"
+# Phase 2 categories
+CATEGORY_THREADING_BROKEN = "THREADING_BROKEN"
+CATEGORY_USE_JOIN = "USE_JOIN"
+CATEGORY_PANDAS_BATCH = "PANDAS_BATCH"
 
 
 def classify(stat: StaticProfile, dyn: DynamicProfile) -> Verdict:
-    # 1. I/O first. If it's doing real I/O and it isn't *also* a numeric
-    #    kernel, cores are not the answer.
+    # NOTE on ordering: the three structural detectors (THREADING_BROKEN,
+    # USE_JOIN, PANDAS_BATCH) MUST run before the I/O check. A function
+    # that does `output += line` in a loop and then writes the result to
+    # disk has both signals -- but the bug is the concat, not the write.
+    # The same goes for a function that uses ThreadPoolExecutor: the
+    # worker may touch files, but the bug is that the GIL serializes the
+    # CPU work in the worker. Structural bugs first, I/O second.
+
+    # 1. Threading wrapped around CPU-bound code. The user already reached
+    #    for a parallelism primitive but picked the GIL-bound one.
+    if stat.threading_on_cpu:
+        return Verdict(
+            qualname=dyn.qualname, filename=dyn.filename, lineno=dyn.lineno,
+            category=CATEGORY_THREADING_BROKEN,
+            reason=(
+                "This function dispatches to threading.Thread / "
+                "ThreadPoolExecutor, but the worker function it hands off "
+                "to is pure-Python CPU work (no I/O calls, no GIL-releasing "
+                "C extension calls). The GIL serializes it -- your threads "
+                "are taking turns, not running in parallel, and the 'parallel' "
+                "version is no faster than a sequential loop. Fix: switch to "
+                "concurrent.futures.ProcessPoolExecutor (or multiprocessing.Pool) "
+                "if the work is independent and the inputs/outputs are "
+                "picklable. If the worker is itself a tight numeric loop, "
+                "audit the worker separately first -- you may want to "
+                "vectorize it before parallelizing at all."
+            ),
+            wall_share=dyn.wall_share, alloc_per_call=dyn.alloc_per_call,
+        )
+
+    # 1b. Quadratic string concatenation in a loop. Very specific fix
+    #     (`''.join`), recommending Rust here would be embarrassing.
+    if stat.string_concat_in_loop:
+        return Verdict(
+            qualname=dyn.qualname, filename=dyn.filename, lineno=dyn.lineno,
+            category=CATEGORY_USE_JOIN,
+            reason=(
+                "Quadratic string concatenation: this function builds a "
+                "string with `+=` inside a loop. Each `+=` on a Python str "
+                "allocates a new PyUnicode and copies both operands -- "
+                "O(n) per iteration, O(n^2) over the loop. CPython has an "
+                "in-place optimization that hides this for small loops, "
+                "so the bug looks fine in dev and explodes in prod once "
+                "the row count crosses the threshold where the optimization "
+                "stops firing. Fix: build a list of pieces inside the loop "
+                "and call `''.join(pieces)` (or `'\\n'.join(...)`) once "
+                "after the loop. O(n), no quadratic surprise."
+            ),
+            wall_share=dyn.wall_share, alloc_per_call=dyn.alloc_per_call,
+        )
+
+    # 1c. Pandas DataFrame growing in a loop. Same O(n^2) shape as 1b but
+    #     with a different fix.
+    if stat.pandas_grow_in_loop:
+        return Verdict(
+            qualname=dyn.qualname, filename=dyn.filename, lineno=dyn.lineno,
+            category=CATEGORY_PANDAS_BATCH,
+            reason=(
+                "Pandas DataFrame is being grown one row at a time inside "
+                "a loop (via pd.concat([df, ...]) or df.append). Each "
+                "iteration reallocates the entire accumulated frame, so "
+                "the loop is O(n^2) in row count. There is no CPython "
+                "optimization to hide this -- it bites immediately as soon "
+                "as the row count gets serious (a few thousand rows is "
+                "enough to feel it). Fix: build a list of row dicts (or "
+                "small frames) inside the loop, then call "
+                "`pd.DataFrame(rows)` (or `pd.concat(frames)`) ONCE after "
+                "the loop. O(n) and dramatically less memory churn. This "
+                "is exactly why pandas 2.x deprecated DataFrame.append."
+            ),
+            wall_share=dyn.wall_share, alloc_per_call=dyn.alloc_per_call,
+        )
+
+    # 1d. I/O bound (after structural checks). If the function is doing
+    #     real I/O and isn't a numeric kernel, cores aren't the answer.
     if stat.io_calls and not stat.nested_numeric_loop:
         return Verdict(
             qualname=dyn.qualname, filename=dyn.filename, lineno=dyn.lineno,
@@ -520,14 +793,44 @@ def audit(target: str, target_args: List[str], min_share: float) -> List[Verdict
     dyn_map = summarize_dynamic(stats, snap_before, snap_after, target)
 
     verdicts: List[Verdict] = []
+    seen_keys: set = set()
     for key, dyn in dyn_map.items():
-        if dyn.wall_share < min_share:
-            continue
         stat = static_map.get(key) or StaticProfile(
             qualname=dyn.qualname, filename=dyn.filename, lineno=dyn.lineno
         )
+        # Structural bugs (USE_JOIN / PANDAS_BATCH / THREADING_BROKEN) get
+        # reported regardless of wall share -- they're scaling/correctness
+        # bugs that aren't currently dominant only because something else
+        # outranks them. If you fix the dominant bug first, these become
+        # the next bottleneck and the user should already know.
+        is_structural = (
+            stat.string_concat_in_loop
+            or stat.pandas_grow_in_loop
+            or stat.threading_on_cpu
+        )
+        if dyn.wall_share < min_share and not is_structural:
+            continue
         verdicts.append(classify(stat, dyn))
-    verdicts.sort(key=lambda v: v.wall_share, reverse=True)
+        seen_keys.add(key)
+
+    # Some structural bugs may live in functions cProfile didn't sample
+    # (e.g. functions called only via thread workers, where cProfile loses
+    # them under multiprocessing/threading). Sweep the static map for any
+    # such functions and synthesize a zero-wall-share Verdict for them.
+    for key, stat in static_map.items():
+        if key in seen_keys:
+            continue
+        if not (stat.string_concat_in_loop or stat.pandas_grow_in_loop or stat.threading_on_cpu):
+            continue
+        synthetic = DynamicProfile(
+            qualname=stat.qualname, filename=stat.filename, lineno=stat.lineno,
+        )
+        verdicts.append(classify(stat, synthetic))
+
+    # Sort: structural bugs first (they're actionable regardless of current
+    # wall share), then by wall share descending.
+    structural_set = {CATEGORY_THREADING_BROKEN, CATEGORY_USE_JOIN, CATEGORY_PANDAS_BATCH}
+    verdicts.sort(key=lambda v: (v.category not in structural_set, -v.wall_share))
     return verdicts
 
 
