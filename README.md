@@ -91,3 +91,65 @@ This is the auditor's actual value proposition on production code: real
 scripts often need **three different kinds of fix**, not just one big
 rewrite. Fixing one moves the bottleneck to the next; the audit shows all
 three at once so you can plan the order of attack.
+
+---
+
+## Spatial-matching engines — benchmarkable head-to-head
+
+`REWRITE_LOWLEVEL` is the auditor's recommendation. The two engines in this
+repo are the concrete answer to it for GPS-trip → OSM-road-link matching.
+They implement **the same logical task** with deliberately different memory
+layouts so you can measure the trade-off directly.
+
+| Engine | File | Memory layout | Spatial index |
+|---|---|---|---|
+| **Numba / Polars / Dask** | `get_ids.py` + `engines/numba_engine.py` | Structure-of-Arrays (SoA) — 7 flat contiguous `float64` arrays; strings stay in Polars, never cross the hot loop | Flat uniform grid + `np.searchsorted` — no pointer chasing |
+| **Rust / PyO3** | `src/lib.rs` | Array-of-Structures (AoS) — `Vec<LinkData>` with `String` fields per link | `KdTree<f64, usize, [f64;2]>` — pointer tree, rayon parallelism |
+
+### Install
+
+```bash
+# Python pipeline (Numba + Polars + Dask)
+pip install -r requirements.txt
+
+# Rust extension (needed for parity benchmark; requires the Rust toolchain)
+pip install maturin
+maturin develop --release    # builds spatial_lookup.so into the active venv
+```
+
+Install the Rust toolchain from <https://rustup.rs> if not already present.
+
+### Run the parity benchmark
+
+```bash
+pip install -r requirements-dev.txt
+
+# Numba engine only (Rust extension not required)
+pytest tests/test_pipeline_parity.py -v -s
+
+# Full head-to-head including Rust (after maturin develop --release)
+pytest tests/test_pipeline_parity.py -v -s
+```
+
+Both engines are tested on the same synthetic dataset (500 road links, 60
+planted queries with known ground-truth matches, 40 far-away noise queries).
+The test asserts:
+1. Each planted query resolves to the expected link.
+2. Far-away noise queries return no match.
+3. Numba and Rust agree on all 60 planted matches (cross-engine parity).
+
+Timings are printed to stdout via `-s`.
+
+### End-to-end Dask pipeline
+
+```bash
+python get_ids.py \
+    --links_parquet links.parquet \
+    --input_csv     trips.csv \
+    --output        matched.csv
+```
+
+`links.parquet` must have columns `start_lon`, `start_lat`, `end_lon`,
+`end_lat`, `start_node`, `end_node`, `roadtype` (plus any extras, kept
+as-is in the output). `trips.csv` must have a `wkt` column with
+`LINESTRING` geometries.

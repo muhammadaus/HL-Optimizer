@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "spatial_lookup"
+version = "0.1.0"
+description = "Rust/PyO3 KdTree spatial-matching engine for HL-Optimizer"
+requires-python = ">=3.8"
+
+[tool.maturin]
+# Compile src/lib.rs as a Python extension module.
+features = ["pyo3/extension-module"]

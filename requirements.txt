@@ -1,0 +1,7 @@
+# Runtime dependencies — Numba/Polars/Dask pipeline (get_ids.py + engines/)
+numpy>=1.24
+polars>=0.20
+numba>=0.59
+dask[distributed]>=2024.1
+pandas>=2.0
+pyyaml>=6.0

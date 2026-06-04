@@ -1,0 +1,4 @@
+# Dev / test dependencies
+-r requirements.txt
+pytest>=8.0
+maturin>=1.5,<2        # needed to build the Rust spatial_lookup extension

@@ -1,0 +1,25 @@
+[package]
+name = "spatial_lookup"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "spatial_lookup"
+crate-type = ["cdylib"]
+
+[dependencies]
+# PyO3 0.21.x — matches the Bound<'_,…> / PyBytes::new_bound API used in lib.rs.
+# abi3 feature enables a single wheel for CPython 3.8+.
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+
+kdtree      = "0.7"
+rayon       = "1.10"
+osmpbf      = "0.3"
+rustc-hash  = "2.0"
+serde       = { version = "1", features = ["derive"] }
+bincode     = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
