@@ -1,7 +1,11 @@
-# Runtime dependencies — Numba/Polars/Dask pipeline (get_ids.py + engines/)
+# Runtime dependencies — Numba/Polars/Dask pipeline + route enricher
 numpy>=1.24
 polars>=0.20
 numba>=0.59
 dask[distributed]>=2024.1
 pandas>=2.0
 pyyaml>=6.0
+pygeohash>=3.0          # geohash-keyed route enrichment cache
+geopandas>=0.14         # GeoParquet read/write
+pyarrow>=14.0           # Arrow backend for GeoParquet
+osmium>=4.0             # OSM PBF parsing (benchmark script)

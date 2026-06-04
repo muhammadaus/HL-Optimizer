@@ -7,6 +7,9 @@ name = "spatial_lookup"
 version = "0.1.0"
 description = "Rust/PyO3 KdTree spatial-matching engine for HL-Optimizer"
 requires-python = ">=3.8"
+dependencies = [
+    "pygeohash>=3.3.0",
+]
 
 [tool.maturin]
 # Compile src/lib.rs as a Python extension module.
