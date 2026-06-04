@@ -5,7 +5,7 @@ Architecture
 ~~~~~~~~~~~~
 Polars columnar WKT parse  →  flat SoA spatial index  →  Numba @njit parallel
 kernel  →  Dask distributed fan-out  →  Polars integer-index join back to
-link metadata strings.
+link metadata strings  →  optional Mapbox route enrichment.
 
 The two engines (this file vs. src/lib.rs) use deliberately different memory
 layouts so they can be benchmarked head-to-head.  See engines/numba_engine.py
@@ -18,13 +18,26 @@ Usage
         --input_csv     trips.csv \\
         --output        matched.csv
 
+    # With route enrichment (requires MAPBOX_ACCESS_TOKEN env var):
+    python get_ids.py \\
+        --links_parquet links.parquet \\
+        --input_csv     trips.csv \\
+        --output        matched.csv \\
+        --enrich
+
 links.parquet must have columns:
     start_lon, start_lat, end_lon, end_lat  (Float64)
     start_node, end_node, roadtype          (Utf8, optional extras kept as-is)
 
 trips.csv must have a 'wkt' column with LINESTRING geometries.
+
+Enriched output adds per-row columns:
+    distance_meters, duration_seconds, traffic_duration_seconds,
+    congestion (JSON list), route_geometry (encoded polyline),
+    tolls, enrichment_error
 """
 
+import json
 import os
 import argparse
 import time
@@ -40,6 +53,7 @@ from engines.numba_engine import (
     match_bulk_numba,
     parse_wkt_polars,
 )
+from engines.route_enricher import enrich_batch
 
 
 def main() -> None:
@@ -54,6 +68,11 @@ def main() -> None:
                         help="Parquet link table (start_lon/lat, end_lon/lat, …).")
     parser.add_argument("--output", required=True,
                         help="Output CSV path for matched results.")
+    parser.add_argument("--enrich", action="store_true",
+                        help="Enrich matched pairs with Mapbox routing metrics "
+                             "(requires MAPBOX_ACCESS_TOKEN env var).")
+    parser.add_argument("--enrich_mode", default="driving-traffic",
+                        help="Mapbox routing profile (default: driving-traffic).")
     args = parser.parse_args()
 
     approx_radius: float = 0.0002   # degrees — candidate pre-filter radius
@@ -128,6 +147,65 @@ def main() -> None:
         right_on="row_idx",
         how="left",
     )
+
+    # ------------------------------------------------------------------
+    # 5. Optional: enrich matched pairs with Mapbox routing metrics
+    #    Only rows where a link was matched (match_idx >= 0) are enriched.
+    #    Results are cached by geohash key — repeated endpoint pairs are free.
+    # ------------------------------------------------------------------
+    if args.enrich:
+        print("Enriching matched pairs via Mapbox Directions API …")
+
+        # Build the list of (origin, destination) from the matched coordinates.
+        # start_lon/lat are the query trip endpoints already parsed in step 2;
+        # they are the two points we want to route between.
+        matched_mask = df_final["match_idx"].cast(pl.Int64) >= 0
+
+        origins      = df_final.filter(matched_mask).select(["start_lon", "start_lat"])
+        destinations = df_final.filter(matched_mask).select(["end_lon",   "end_lat"])
+
+        pairs = [
+            {
+                "origin":      [origins[i, "start_lon"], origins[i, "start_lat"]],
+                "destination": [destinations[i, "end_lon"], destinations[i, "end_lat"]],
+            }
+            for i in range(len(origins))
+        ]
+
+        route_results = enrich_batch(pairs, mode=args.enrich_mode)
+
+        # Expand results into flat columns aligned to df_final row positions
+        distance_m, duration_s, traffic_s, congestion_j, geometry, tolls_b, errors = (
+            [], [], [], [], [], [], []
+        )
+        result_iter = iter(route_results)
+        for matched in df_final["match_idx"].cast(pl.Int64).to_list():
+            if matched >= 0:
+                r = next(result_iter)
+                distance_m.append(r.distance_meters)
+                duration_s.append(r.duration_seconds)
+                traffic_s.append(r.traffic_duration_seconds)
+                congestion_j.append(json.dumps(r.congestion) if r.congestion else None)
+                geometry.append(r.route_geometry)
+                tolls_b.append(r.tolls)
+                errors.append(r.error)
+            else:
+                distance_m.append(None); duration_s.append(None)
+                traffic_s.append(None);  congestion_j.append(None)
+                geometry.append(None);   tolls_b.append(None)
+                errors.append(None)
+
+        df_final = df_final.with_columns([
+            pl.Series("distance_meters",          distance_m),
+            pl.Series("duration_seconds",         duration_s),
+            pl.Series("traffic_duration_seconds", traffic_s),
+            pl.Series("congestion",               congestion_j),
+            pl.Series("route_geometry",           geometry),
+            pl.Series("tolls",                    tolls_b),
+            pl.Series("enrichment_error",         errors),
+        ])
+        n_enriched = sum(1 for e in errors if e is None and distance_m[errors.index(e)] is not None)
+        print(f"  Enriched {n_enriched:,} / {matched_mask.sum():,} matched rows.")
 
     print(f"Saving results to {args.output} …")
     df_final.write_csv(args.output)
