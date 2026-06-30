@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ACCT_N=2000 python3:*)",
+      "Bash(ACCT_N=800 python3 hl_audit.py samples/accounting_export_demo.py --min-share 0.05)"
+    ]
+  }
+}

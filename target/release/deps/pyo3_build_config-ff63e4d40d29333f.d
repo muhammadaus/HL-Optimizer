@@ -1,0 +1,14 @@
+/Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/deps/pyo3_build_config-ff63e4d40d29333f.d: /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/lib.rs /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/errors.rs /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/impl_.rs /Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out/pyo3-build-config-file.txt /Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out/pyo3-build-config.txt
+
+/Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/deps/libpyo3_build_config-ff63e4d40d29333f.rlib: /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/lib.rs /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/errors.rs /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/impl_.rs /Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out/pyo3-build-config-file.txt /Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out/pyo3-build-config.txt
+
+/Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/deps/libpyo3_build_config-ff63e4d40d29333f.rmeta: /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/lib.rs /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/errors.rs /Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/impl_.rs /Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out/pyo3-build-config-file.txt /Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out/pyo3-build-config.txt
+
+/Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/lib.rs:
+/Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/errors.rs:
+/Users/muhammadaushijri/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.21.2/src/impl_.rs:
+/Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out/pyo3-build-config-file.txt:
+/Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out/pyo3-build-config.txt:
+
+# env-dep:CARGO_PKG_VERSION=0.21.2
+# env-dep:OUT_DIR=/Users/muhammadaushijri/Desktop/git/HL-Optimizer/target/release/build/pyo3-build-config-2695b8c6873ca11b/out
